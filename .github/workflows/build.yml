@@ -52,8 +52,8 @@ jobs:
                   applicationId "com.mini.storage"
                   minSdk 24
                   targetSdk 35
-                  versionCode 2
-                  versionName "1.1"
+                  versionCode 3
+                  versionName "2.0"
               }
               buildTypes {
                   release {
@@ -77,6 +77,7 @@ jobs:
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
               <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
               <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
               <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
               <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
@@ -84,7 +85,10 @@ jobs:
                   android:label="MiniStorage"
                   android:requestLegacyExternalStorage="true"
                   android:theme="@android:style/Theme.DeviceDefault">
-                  <activity android:name=".MainActivity" android:exported="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="stateHidden|adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -99,31 +103,45 @@ jobs:
 
           import android.Manifest;
           import android.app.Activity;
+          import android.app.ActivityManager;
           import android.app.AlertDialog;
           import android.app.AppOpsManager;
           import android.app.usage.StorageStats;
           import android.app.usage.StorageStatsManager;
+          import android.app.usage.UsageStats;
+          import android.app.usage.UsageStatsManager;
           import android.content.ComponentName;
           import android.content.Context;
           import android.content.Intent;
+          import android.content.pm.ActivityInfo;
           import android.content.pm.ApplicationInfo;
           import android.content.pm.PackageInfo;
           import android.content.pm.PackageManager;
+          import android.content.pm.PermissionInfo;
+          import android.content.pm.ProviderInfo;
+          import android.content.pm.ServiceInfo;
+          import android.content.pm.Signature;
           import android.graphics.drawable.Drawable;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
+          import android.os.Debug;
           import android.os.Environment;
           import android.os.Process;
+          import android.os.StatFs;
           import android.os.storage.StorageManager;
           import android.provider.DocumentsContract;
           import android.provider.Settings;
+          import android.text.Editable;
+          import android.text.TextWatcher;
           import android.text.format.Formatter;
           import android.view.Gravity;
           import android.view.View;
           import android.view.ViewGroup;
           import android.widget.BaseAdapter;
           import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
           import android.widget.ImageView;
           import android.widget.LinearLayout;
           import android.widget.ListView;
@@ -132,14 +150,28 @@ jobs:
           import android.widget.TextView;
           import android.widget.Toast;
 
+          import java.io.BufferedReader;
+          import java.io.ByteArrayOutputStream;
           import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.FileReader;
+          import java.io.InputStream;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+          import java.security.MessageDigest;
           import java.text.SimpleDateFormat;
           import java.util.ArrayList;
           import java.util.Collections;
-          import java.util.Comparator;
           import java.util.Date;
+          import java.util.HashMap;
+          import java.util.HashSet;
           import java.util.List;
           import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
 
           public class MainActivity extends Activity {
 
@@ -147,10 +179,12 @@ jobs:
                   String name;
                   String pkg;
                   Drawable icon;
-                  long totalAppSize; // Вес со всеми данными и кэшем
-                  long apkOnlySize;  // Только вес пакета (APK)
+                  long totalAppSize;
+                  long apkOnlySize;
                   long dataSize;
                   long cacheSize;
+                  long installTime;
+                  boolean isSystem;
                   PackageInfo pkgInfo;
               }
 
@@ -162,23 +196,67 @@ jobs:
                   boolean isDir;
               }
 
-              private final List<AppItem> appList = new ArrayList<>();
-              private final List<FolderItem> folderList = new ArrayList<>();
+              static class AnalyzerItem {
+                  String title;
+                  String subtitle;
+                  File file;
+                  long size;
+                  boolean isHeader;
+              }
+
+              static class ProcItem {
+                  String name;
+                  String pkg;
+                  String stateInfo;
+                  Drawable icon;
+                  int pid;
+                  int uid;
+                  long ramBytes;
+                  long lastActive;
+                  boolean isSystem;
+              }
+
+              private final List<AppItem> allApps = new ArrayList<>();
+              private final List<AppItem> displayApps = new ArrayList<>();
+
+              private final List<FolderItem> allFolders = new ArrayList<>();
+              private final List<FolderItem> displayFolders = new ArrayList<>();
+
+              private final List<AnalyzerItem> allAnalyzer = new ArrayList<>();
+              private final List<AnalyzerItem> displayAnalyzer = new ArrayList<>();
+
+              private final List<ProcItem> allProcs = new ArrayList<>();
+              private final List<ProcItem> displayProcs = new ArrayList<>();
+
+              private final Set<String> selectedApps = new HashSet<>();
+              private final Set<File> selectedFiles = new HashSet<>();
 
               private BaseAdapter adapterApps;
               private BaseAdapter adapterFolders;
               private BaseAdapter adapterPkgs;
+              private BaseAdapter adapterAnalyzer;
+              private BaseAdapter adapterProcs;
 
               private TextView statusText;
+              private TextView analyzerHeaderText;
               private Button sortBtn;
+              private Button filterBtn;
+              private Button batchDelBtn;
               private Button upFolderBtn;
+              private EditText searchInput;
 
-              // 0: Вес (убыв), 1: Вес (возр), 2: Имя (А-Я), 3: Имя (Я-А)
               private int sortMode = 0;
               private final String[] sortLabels = {
-                  "Сорт: Вес ↓", "Сорт: Вес ↑", "Сорт: А-Я", "Сорт: Я-А"
+                  "Вес ↓", "Вес ↑", "А-Я", "Я-А", "Кэш ↓", "Новые ↓"
               };
 
+              // 0: Все, 1: Польз., 2: Систем.
+              private int appFilterMode = 0;
+              private final String[] filterLabels = {
+                  "Фильтр: Все", "Фильтр: Польз.", "Фильтр: Сист."
+              };
+
+              private String searchQuery = "";
               private File currentFolder;
 
               @Override
@@ -191,36 +269,69 @@ jobs:
                   root.setOrientation(LinearLayout.VERTICAL);
 
                   statusText = new TextView(this);
-                  statusText.setPadding(16, 12, 16, 8);
+                  statusText.setPadding(14, 8, 14, 4);
+                  statusText.setTextSize(12f);
                   statusText.setText("Загрузка...");
                   root.addView(statusText);
 
-                  // Панель управления: Права | Сортировка | Проводник
-                  LinearLayout btnBar = new LinearLayout(this);
-                  btnBar.setOrientation(LinearLayout.HORIZONTAL);
+                  // Ряд 1: Кнопки управления
+                  LinearLayout bar1 = new LinearLayout(this);
+                  bar1.setOrientation(LinearLayout.HORIZONTAL);
 
-                  Button permBtn = new Button(this);
-                  permBtn.setText("Права");
+                  Button permBtn = smallBtn("Права");
                   permBtn.setOnClickListener(v -> requestGeneralPermissions());
-                  btnBar.addView(permBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  bar1.addView(permBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f));
 
-                  sortBtn = new Button(this);
-                  sortBtn.setText(sortLabels[sortMode]);
+                  sortBtn = smallBtn(sortLabels[sortMode]);
                   sortBtn.setOnClickListener(v -> {
-                      sortMode = (sortMode + 1) % 4;
+                      sortMode = (sortMode + 1) % sortLabels.length;
                       sortBtn.setText(sortLabels[sortMode]);
-                      applySorting();
+                      applyFilterAndSort();
                   });
-                  btnBar.addView(sortBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f));
+                  bar1.addView(sortBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.1f));
 
-                  Button filesBtn = new Button(this);
-                  filesBtn.setText("Проводник");
+                  filterBtn = smallBtn(filterLabels[appFilterMode]);
+                  filterBtn.setOnClickListener(v -> {
+                      appFilterMode = (appFilterMode + 1) % filterLabels.length;
+                      filterBtn.setText(filterLabels[appFilterMode]);
+                      applyFilterAndSort();
+                  });
+                  bar1.addView(filterBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f));
+
+                  Button filesBtn = smallBtn("Файлы");
                   filesBtn.setOnClickListener(v -> openSystemFilesApp());
-                  btnBar.addView(filesBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  bar1.addView(filesBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f));
 
-                  root.addView(btnBar);
+                  root.addView(bar1);
 
-                  // Вкладки: Приложения | Папки | Пакеты
+                  // Ряд 2: Поиск + Пакетное удаление
+                  LinearLayout bar2 = new LinearLayout(this);
+                  bar2.setOrientation(LinearLayout.HORIZONTAL);
+                  bar2.setGravity(Gravity.CENTER_VERTICAL);
+                  bar2.setPadding(8, 0, 8, 4);
+
+                  searchInput = new EditText(this);
+                  searchInput.setHint("Поиск (имя, пакет, файл)...");
+                  searchInput.setSingleLine(true);
+                  searchInput.setTextSize(13f);
+                  searchInput.addTextChangedListener(new TextWatcher() {
+                      @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+                      @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                          searchQuery = s.toString().trim().toLowerCase(Locale.getDefault());
+                          applyFilterAndSort();
+                      }
+                      @Override public void afterTextChanged(Editable s) {}
+                  });
+                  bar2.addView(searchInput, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  batchDelBtn = smallBtn("Удалить (0)");
+                  batchDelBtn.setVisibility(View.GONE);
+                  batchDelBtn.setOnClickListener(v -> confirmBatchDelete());
+                  bar2.addView(batchDelBtn);
+
+                  root.addView(bar2);
+
+                  // Вкладки
                   TabHost tabHost = new TabHost(this, null);
                   tabHost.setId(android.R.id.tabhost);
                   LinearLayout tabLayout = new LinearLayout(this);
@@ -240,12 +351,10 @@ jobs:
                   adapterApps = createAppAdapter(true);
                   listApps.setAdapter(adapterApps);
 
-                  // Вкладка 2: Папки (с кнопкой возврата на уровень выше)
+                  // Вкладка 2: Папки
                   LinearLayout folderTabLayout = new LinearLayout(this);
                   folderTabLayout.setOrientation(LinearLayout.VERTICAL);
-
-                  upFolderBtn = new Button(this);
-                  upFolderBtn.setText("⬆ Наверх (Корень памяти)");
+                  upFolderBtn = smallBtn("⬆ Назад");
                   upFolderBtn.setVisibility(View.GONE);
                   upFolderBtn.setOnClickListener(v -> {
                       File rootDir = Environment.getExternalStorageDirectory();
@@ -255,31 +364,148 @@ jobs:
                       }
                   });
                   folderTabLayout.addView(upFolderBtn);
-
                   ListView listFolders = new ListView(this);
                   adapterFolders = createFolderAdapter();
                   listFolders.setAdapter(adapterFolders);
                   folderTabLayout.addView(listFolders, new LinearLayout.LayoutParams(
                           ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-                  // Вкладка 3: Пакеты (без данных и папок)
+                  // Вкладка 3: Пакеты
                   ListView listPkgs = new ListView(this);
                   adapterPkgs = createAppAdapter(false);
                   listPkgs.setAdapter(adapterPkgs);
 
+                  // Вкладка 4: Анализ памяти (Категории, Топ-100, Дубликаты, Пустые папки и остатки)
+                  LinearLayout analyzerLayout = new LinearLayout(this);
+                  analyzerLayout.setOrientation(LinearLayout.VERTICAL);
+
+                  analyzerHeaderText = new TextView(this);
+                  analyzerHeaderText.setPadding(12, 8, 12, 8);
+                  analyzerHeaderText.setTextSize(11.5f);
+                  analyzerHeaderText.setText("Нажмите кнопку ниже для глубокого анализа памяти...");
+                  analyzerLayout.addView(analyzerHeaderText);
+
+                  LinearLayout anBtnBar = new LinearLayout(this);
+                  anBtnBar.setOrientation(LinearLayout.HORIZONTAL);
+
+                  Button btnTopFiles = smallBtn("Топ-100 файлов");
+                  btnTopFiles.setOnClickListener(v -> runDeepStorageAnalysis(0));
+                  anBtnBar.addView(btnTopFiles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  Button btnDupes = smallBtn("Дубликаты");
+                  btnDupes.setOnClickListener(v -> runDeepStorageAnalysis(1));
+                  anBtnBar.addView(btnDupes, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  Button btnEmpty = smallBtn("Пустые/Остатки");
+                  btnEmpty.setOnClickListener(v -> runDeepStorageAnalysis(2));
+                  anBtnBar.addView(btnEmpty, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  analyzerLayout.addView(anBtnBar);
+
+                  ListView listAnalyzer = new ListView(this);
+                  adapterAnalyzer = createAnalyzerAdapter();
+                  listAnalyzer.setAdapter(adapterAnalyzer);
+                  analyzerLayout.addView(listAnalyzer, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  // Вкладка 5: Диспетчер процессов (Свои и Системные)
+                  LinearLayout procLayout = new LinearLayout(this);
+                  procLayout.setOrientation(LinearLayout.VERTICAL);
+
+                  LinearLayout procBar = new LinearLayout(this);
+                  procBar.setOrientation(LinearLayout.HORIZONTAL);
+
+                  Button refreshProcBtn = smallBtn("Обновить процессы");
+                  refreshProcBtn.setOnClickListener(v -> loadProcessesAsync());
+                  procBar.addView(refreshProcBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  Button killAllBgBtn = smallBtn("Очистить фон (Все)");
+                  killAllBgBtn.setOnClickListener(v -> killAllBackgroundProcesses());
+                  procBar.addView(killAllBgBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  procLayout.addView(procBar);
+
+                  ListView listProcs = new ListView(this);
+                  adapterProcs = createProcAdapter();
+                  listProcs.setAdapter(adapterProcs);
+                  procLayout.addView(listProcs, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
                   tabHost.setup();
-                  tabHost.addTab(tabHost.newTabSpec("t_apps").setIndicator("Приложения").setContent(tag -> listApps));
-                  tabHost.addTab(tabHost.newTabSpec("t_folders").setIndicator("Папки").setContent(tag -> folderTabLayout));
-                  tabHost.addTab(tabHost.newTabSpec("t_pkgs").setIndicator("Пакеты").setContent(tag -> listPkgs));
+                  tabHost.addTab(tabHost.newTabSpec("t1").setIndicator("Прил.").setContent(tag -> listApps));
+                  tabHost.addTab(tabHost.newTabSpec("t2").setIndicator("Папки").setContent(tag -> folderTabLayout));
+                  tabHost.addTab(tabHost.newTabSpec("t3").setIndicator("Пакеты").setContent(tag -> listPkgs));
+                  tabHost.addTab(tabHost.newTabSpec("t4").setIndicator("Анализ").setContent(tag -> analyzerLayout));
+                  tabHost.addTab(tabHost.newTabSpec("t5").setIndicator("Процессы").setContent(tag -> procLayout));
 
                   root.addView(tabHost);
                   setContentView(root);
+
+                  updatePartitionsHeader();
+              }
+
+              private Button smallBtn(String text) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setTextSize(11f);
+                  b.setPadding(6, 6, 6, 6);
+                  return b;
               }
 
               @Override
               protected void onResume() {
                   super.onResume();
-                  loadAllAsync();
+                  loadAppsAsync();
+                  loadFoldersAsync();
+                  loadProcessesAsync();
+              }
+
+              private void updateBatchButton() {
+                  int total = selectedApps.size() + selectedFiles.size();
+                  if (total > 0) {
+                      batchDelBtn.setVisibility(View.VISIBLE);
+                      batchDelBtn.setText("Удалить (" + total + ")");
+                  } else {
+                      batchDelBtn.setVisibility(View.GONE);
+                  }
+              }
+
+              private void confirmBatchDelete() {
+                  int appCount = selectedApps.size();
+                  int fileCount = selectedFiles.size();
+                  new AlertDialog.Builder(this)
+                          .setTitle("Пакетное удаление")
+                          .setMessage("Выбрано приложений: " + appCount + "\nВыбрано папок/файлов: " + fileCount + "\nПродолжить удаление?")
+                          .setPositiveButton("Удалить", (d, w) -> {
+                              for (String pkg : new ArrayList<>(selectedApps)) {
+                                  Intent intent = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + pkg));
+                                  startActivity(intent);
+                              }
+                              selectedApps.clear();
+
+                              if (!selectedFiles.isEmpty()) {
+                                  new Thread(() -> {
+                                      for (File f : new ArrayList<>(selectedFiles)) {
+                                          deleteRecursive(f);
+                                      }
+                                      selectedFiles.clear();
+                                      runOnUiThread(() -> {
+                                          updateBatchButton();
+                                          loadFoldersAsync();
+                                          Toast.makeText(this, "Выбранные файлы удалены", Toast.LENGTH_SHORT).show();
+                                      });
+                                  }).start();
+                              } else {
+                                  updateBatchButton();
+                              }
+                          })
+                          .setNegativeButton("Отмена", (d, w) -> {
+                              selectedApps.clear();
+                              selectedFiles.clear();
+                              updateBatchButton();
+                              applyFilterAndSort();
+                          })
+                          .show();
               }
 
               private void requestGeneralPermissions() {
@@ -331,17 +557,11 @@ jobs:
                   return mode == AppOpsManager.MODE_ALLOWED;
               }
 
-              private void loadAllAsync() {
-                  loadAppsAsync();
-                  loadFoldersAsync();
-              }
-
               private void loadAppsAsync() {
-                  statusText.setText("Сканирование приложений и папок...");
                   new Thread(() -> {
                       PackageManager pm = getPackageManager();
                       List<PackageInfo> packages = pm.getInstalledPackages(0);
-                      List<AppItem> tempApps = new ArrayList<>();
+                      List<AppItem> temp = new ArrayList<>();
                       boolean hasUsage = hasUsageStatsPermission();
 
                       for (PackageInfo pi : packages) {
@@ -353,6 +573,8 @@ jobs:
                           item.pkg = pi.packageName;
                           item.name = ai.loadLabel(pm).toString();
                           item.icon = ai.loadIcon(pm);
+                          item.installTime = pi.firstInstallTime;
+                          item.isSystem = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
 
                           long apkBytes = new File(ai.sourceDir).length();
                           if (ai.splitSourceDirs != null) {
@@ -373,13 +595,13 @@ jobs:
                                   item.totalAppSize = stats.getAppBytes() + stats.getDataBytes() + stats.getCacheBytes();
                               } catch (Exception ignored) {}
                           }
-                          tempApps.add(item);
+                          temp.add(item);
                       }
 
                       runOnUiThread(() -> {
-                          appList.clear();
-                          appList.addAll(tempApps);
-                          applySorting();
+                          allApps.clear();
+                          allApps.addAll(temp);
+                          applyFilterAndSort();
                           updateStatusBanner();
                       });
                   }).start();
@@ -391,7 +613,7 @@ jobs:
                           currentFolder = Environment.getExternalStorageDirectory();
                       }
                       File[] files = currentFolder.listFiles();
-                      List<FolderItem> tempFolders = new ArrayList<>();
+                      List<FolderItem> temp = new ArrayList<>();
 
                       if (files != null) {
                           for (File f : files) {
@@ -407,13 +629,13 @@ jobs:
                                   fi.itemCount = 1;
                                   fi.size = f.length();
                               }
-                              tempFolders.add(fi);
+                              temp.add(fi);
                           }
                       }
 
                       runOnUiThread(() -> {
-                          folderList.clear();
-                          folderList.addAll(tempFolders);
+                          allFolders.clear();
+                          allFolders.addAll(temp);
                           File rootDir = Environment.getExternalStorageDirectory();
                           if (currentFolder.equals(rootDir)) {
                               upFolderBtn.setVisibility(View.GONE);
@@ -421,34 +643,382 @@ jobs:
                               upFolderBtn.setVisibility(View.VISIBLE);
                               upFolderBtn.setText("⬆ Назад (из " + currentFolder.getName() + ")");
                           }
-                          applySorting();
+                          applyFilterAndSort();
                           updateStatusBanner();
                       });
                   }).start();
               }
 
+              // Загрузка процессов: объединяет ActivityManager (сервисы + процессы), /proc и UsageStats
+              private void loadProcessesAsync() {
+                  new Thread(() -> {
+                      PackageManager pm = getPackageManager();
+                      ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                      Map<String, ProcItem> procMap = new HashMap<>();
+
+                      // 1. Активные сервисы
+                      try {
+                          List<ActivityManager.RunningServiceInfo> services = am.getRunningServices(300);
+                          if (services != null) {
+                              for (ActivityManager.RunningServiceInfo rsi : services) {
+                                  String pkg = rsi.service.getPackageName();
+                                  ProcItem pi = procMap.get(pkg);
+                                  if (pi == null) {
+                                      pi = createProcItem(pm, pkg, rsi.pid, rsi.uid, "Активный сервис (" + rsi.process + ")");
+                                      procMap.put(pkg, pi);
+                                  }
+                              }
+                          }
+                      } catch (Exception ignored) {}
+
+                      // 2. Запущенные процессы из ActivityManager
+                      try {
+                          List<ActivityManager.RunningAppProcessInfo> procs = am.getRunningAppProcesses();
+                          if (procs != null) {
+                              for (ActivityManager.RunningAppProcessInfo rpi : procs) {
+                                  String pkg = rpi.pkgList != null && rpi.pkgList.length > 0 ? rpi.pkgList[0] : rpi.processName;
+                                  if (!procMap.containsKey(pkg)) {
+                                      String imp = importanceToString(rpi.importance);
+                                      ProcItem pi = createProcItem(pm, pkg, rpi.pid, rpi.uid, imp + " (PID: " + rpi.pid + ")");
+                                      procMap.put(pkg, pi);
+                                  }
+                              }
+                          }
+                      } catch (Exception ignored) {}
+
+                      // 3. Чтение доступных процессов из /proc
+                      File procDir = new File("/proc");
+                      File[] procFiles = procDir.listFiles();
+                      if (procFiles != null) {
+                          for (File pf : procFiles) {
+                              String fn = pf.getName();
+                              if (fn.matches("\\d+")) {
+                                  try (BufferedReader br = new BufferedReader(new FileReader(new File(pf, "cmdline")))) {
+                                      String cmd = br.readLine();
+                                      if (cmd != null) {
+                                          cmd = cmd.replace("\0", "").trim();
+                                          String pkg = cmd.contains(":") ? cmd.substring(0, cmd.indexOf(':')) : cmd;
+                                          if (!pkg.isEmpty() && !procMap.containsKey(pkg) && pkg.contains(".")) {
+                                              int pid = Integer.parseInt(fn);
+                                              ProcItem pi = createProcItem(pm, pkg, pid, 0, "Системный /proc (PID: " + pid + ")");
+                                              procMap.put(pkg, pi);
+                                          }
+                                      }
+                                  } catch (Exception ignored) {}
+                              }
+                          }
+                      }
+
+                      // 4. Недавно активные приложения и системные пакеты через UsageStats (за последние 24 часа)
+                      if (hasUsageStatsPermission()) {
+                          UsageStatsManager usm = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
+                          long now = System.currentTimeMillis();
+                          List<UsageStats> stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - 86400_000L, now);
+                          if (stats != null) {
+                              SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
+                              for (UsageStats us : stats) {
+                                  if (us.getLastTimeUsed() > now - 86400_000L) {
+                                      String pkg = us.getPackageName();
+                                      ProcItem existing = procMap.get(pkg);
+                                      if (existing != null) {
+                                          existing.lastActive = us.getLastTimeUsed();
+                                      } else {
+                                          ProcItem pi = createProcItem(pm, pkg, 0, 0,
+                                                  "Фон / Активность: " + sdf.format(new Date(us.getLastTimeUsed())));
+                                          pi.lastActive = us.getLastTimeUsed();
+                                          procMap.put(pkg, pi);
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      // Дополняем объемом памяти по PID, где система разрешает
+                      for (ProcItem item : procMap.values()) {
+                          if (item.pid > 0) {
+                              try {
+                                  Debug.MemoryInfo[] mem = am.getProcessMemoryInfo(new int[]{item.pid});
+                                  if (mem != null && mem.length > 0) {
+                                      item.ramBytes = mem[0].getTotalPss() * 1024L;
+                                  }
+                              } catch (Exception ignored) {}
+                          }
+                      }
+
+                      List<ProcItem> result = new ArrayList<>(procMap.values());
+                      Collections.sort(result, (a, b) -> {
+                          if (a.pid != b.pid) return Integer.compare(b.pid, a.pid);
+                          return Long.compare(b.lastActive, a.lastActive);
+                      });
+
+                      runOnUiThread(() -> {
+                          allProcs.clear();
+                          allProcs.addAll(result);
+                          applyFilterAndSort();
+                      });
+                  }).start();
+              }
+
+              private ProcItem createProcItem(PackageManager pm, String pkg, int pid, int uid, String state) {
+                  ProcItem item = new ProcItem();
+                  item.pkg = pkg;
+                  item.pid = pid;
+                  item.uid = uid;
+                  item.stateInfo = state;
+                  try {
+                      ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                      item.name = ai.loadLabel(pm).toString();
+                      item.icon = ai.loadIcon(pm);
+                      item.uid = ai.uid;
+                      item.isSystem = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+                  } catch (Exception e) {
+                      item.name = pkg;
+                      item.icon = getResources().getDrawable(android.R.drawable.sym_def_app_icon);
+                      item.isSystem = true;
+                  }
+                  return item;
+              }
+
+              private String importanceToString(int imp) {
+                  if (imp <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND) return "На экране";
+                  if (imp <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) return "Видимый";
+                  if (imp <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_SERVICE) return "Сервис";
+                  return "Кэш / Фон";
+              }
+
+              private void killAllBackgroundProcesses() {
+                  new Thread(() -> {
+                      ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                      int count = 0;
+                      for (AppItem app : allApps) {
+                          try {
+                              am.killBackgroundProcesses(app.pkg);
+                              count++;
+                          } catch (Exception ignored) {}
+                      }
+                      final int c = count;
+                      runOnUiThread(() -> {
+                          Toast.makeText(this, "Отправлен сигнал остановки фона для " + c + " пакетов", Toast.LENGTH_SHORT).show();
+                          loadProcessesAsync();
+                      });
+                  }).start();
+              }
+
+              // Глубокий анализ памяти: 0 = Топ-100 файлов, 1 = Дубликаты, 2 = Пустые папки и остатки
+              private void runDeepStorageAnalysis(int mode) {
+                  analyzerHeaderText.setText("Сканирование файловой системы, подождите...");
+                  new Thread(() -> {
+                      File rootDir = Environment.getExternalStorageDirectory();
+                      List<File> allFiles = new ArrayList<>();
+                      List<File> emptyOrCorpseDirs = new ArrayList<>();
+                      long[] catSizes = new long[6]; // 0:Видео, 1:Фото, 2:Аудио, 3:Архивы, 4:APK, 5:Прочее
+
+                      Set<String> installedPkgs = new HashSet<>();
+                      for (AppItem a : allApps) installedPkgs.add(a.pkg);
+
+                      collectFilesRecursive(rootDir, allFiles, emptyOrCorpseDirs, catSizes, installedPkgs);
+
+                      List<AnalyzerItem> results = new ArrayList<>();
+
+                      if (mode == 0) {
+                          // Топ-100 самых больших файлов
+                          Collections.sort(allFiles, (a, b) -> Long.compare(b.length(), a.length()));
+                          int limit = Math.min(100, allFiles.size());
+                          for (int i = 0; i < limit; i++) {
+                              File f = allFiles.get(i);
+                              AnalyzerItem ai = new AnalyzerItem();
+                              ai.title = (i + 1) + ". " + f.getName();
+                              ai.subtitle = f.getParent();
+                              ai.file = f;
+                              ai.size = f.length();
+                              results.add(ai);
+                          }
+                      } else if (mode == 1) {
+                          // Поиск дубликатов (сначала группируем по одинаковому размеру > 50 КБ, затем MD5)
+                          Map<Long, List<File>> bySize = new HashMap<>();
+                          for (File f : allFiles) {
+                              long len = f.length();
+                              if (len > 51200) {
+                                  bySize.computeIfAbsent(len, k -> new ArrayList<>()).add(f);
+                              }
+                          }
+                          for (Map.Entry<Long, List<File>> entry : bySize.entrySet()) {
+                              if (entry.getValue().size() > 1) {
+                                  Map<String, List<File>> byHash = new HashMap<>();
+                                  for (File f : entry.getValue()) {
+                                      String hash = fastFileHash(f);
+                                      if (!hash.isEmpty()) {
+                                          byHash.computeIfAbsent(hash, k -> new ArrayList<>()).add(f);
+                                      }
+                                  }
+                                  for (List<File> dupGroup : byHash.values()) {
+                                      if (dupGroup.size() > 1) {
+                                          for (File f : dupGroup) {
+                                              AnalyzerItem ai = new AnalyzerItem();
+                                              ai.title = "[Дубликат] " + f.getName();
+                                              ai.subtitle = f.getAbsolutePath();
+                                              ai.file = f;
+                                              ai.size = f.length();
+                                              results.add(ai);
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                          Collections.sort(results, (a, b) -> Long.compare(b.size, a.size));
+                      } else if (mode == 2) {
+                          // Пустые папки и папки удаленных приложений в Android/media и Android/obb
+                          File[] mediaDirs = new File(rootDir, "Android/media").listFiles();
+                          if (mediaDirs != null) {
+                              for (File d : mediaDirs) {
+                                  if (d.isDirectory() && !installedPkgs.contains(d.getName())) {
+                                      emptyOrCorpseDirs.add(0, d);
+                                  }
+                              }
+                          }
+                          File[] obbDirs = new File(rootDir, "Android/obb").listFiles();
+                          if (obbDirs != null) {
+                              for (File d : obbDirs) {
+                                  if (d.isDirectory() && !installedPkgs.contains(d.getName())) {
+                                      emptyOrCorpseDirs.add(0, d);
+                                  }
+                              }
+                          }
+                          for (File d : emptyOrCorpseDirs) {
+                              AnalyzerItem ai = new AnalyzerItem();
+                              boolean isCorpse = d.getAbsolutePath().contains("/Android/");
+                              ai.title = (isCorpse ? "[Остаток удаленного прил.] " : "[Пустая папка] ") + d.getName();
+                              ai.subtitle = d.getAbsolutePath();
+                              ai.file = d;
+                              ai.size = getFolderSize(d);
+                              results.add(ai);
+                          }
+                      }
+
+                      final String headerInfo = getPartitionsString() + "\n" +
+                              "Видео: " + fmt(catSizes[0]) + " | Фото: " + fmt(catSizes[1]) + " | Аудио: " + fmt(catSizes[2]) + "\n" +
+                              "Архивы: " + fmt(catSizes[3]) + " | APK: " + fmt(catSizes[4]) + " | Прочее: " + fmt(catSizes[5]);
+
+                      runOnUiThread(() -> {
+                          analyzerHeaderText.setText(headerInfo);
+                          allAnalyzer.clear();
+                          allAnalyzer.addAll(results);
+                          applyFilterAndSort();
+                      });
+                  }).start();
+              }
+
+              private void collectFilesRecursive(File dir, List<File> allFiles, List<File> emptyDirs, long[] cats, Set<String> pkgs) {
+                  if (dir == null || !dir.exists()) return;
+                  File[] files = dir.listFiles();
+                  if (files == null) return;
+                  if (files.length == 0 && !dir.equals(Environment.getExternalStorageDirectory())) {
+                      emptyDirs.add(dir);
+                      return;
+                  }
+                  for (File f : files) {
+                      if (f.isDirectory()) {
+                          collectFilesRecursive(f, allFiles, emptyDirs, cats, pkgs);
+                      } else {
+                          allFiles.add(f);
+                          long len = f.length();
+                          String n = f.getName().toLowerCase(Locale.getDefault());
+                          if (n.endsWith(".mp4") || n.endsWith(".mkv") || n.endsWith(".avi") || n.endsWith(".mov") || n.endsWith(".webm")) cats[0] += len;
+                          else if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") || n.endsWith(".webp") || n.endsWith(".gif")) cats[1] += len;
+                          else if (n.endsWith(".mp3") || n.endsWith(".flac") || n.endsWith(".wav") || n.endsWith(".ogg") || n.endsWith(".m4a")) cats[2] += len;
+                          else if (n.endsWith(".zip") || n.endsWith(".rar") || n.endsWith(".7z") || n.endsWith(".tar") || n.endsWith(".gz")) cats[3] += len;
+                          else if (n.endsWith(".apk") || n.endsWith(".apks") || n.endsWith(".xapk")) cats[4] += len;
+                          else cats[5] += len;
+                      }
+                  }
+              }
+
+              // Быстрый MD5 по первым и последним 16 КБ файла для мгновенного поиска дубликатов
+              private String fastFileHash(File f) {
+                  try (FileInputStream fis = new FileInputStream(f)) {
+                      MessageDigest md = MessageDigest.getInstance("MD5");
+                      byte[] buf = new byte[16384];
+                      int r = fis.read(buf);
+                      if (r > 0) md.update(buf, 0, r);
+                      if (f.length() > 32768) {
+                          fis.skip(f.length() - 32768);
+                          r = fis.read(buf);
+                          if (r > 0) md.update(buf, 0, r);
+                      }
+                      byte[] digest = md.digest();
+                      StringBuilder sb = new StringBuilder();
+                      for (byte b : digest) sb.append(String.format("%02x", b));
+                      return sb.toString();
+                  } catch (Exception e) {
+                      return "";
+                  }
+              }
+
+              private void updatePartitionsHeader() {
+                  analyzerHeaderText.setText(getPartitionsString() + "\nВыберите режим сканирования кнопками ниже:");
+              }
+
+              private String getPartitionsString() {
+                  return "Разделы -> /data: " + getStatFsInfo(Environment.getDataDirectory()) +
+                          " | /system: " + getStatFsInfo(Environment.getRootDirectory());
+              }
+
+              private String getStatFsInfo(File path) {
+                  try {
+                      StatFs stat = new StatFs(path.getAbsolutePath());
+                      long total = stat.getTotalBytes();
+                      long used = total - stat.getAvailableBytes();
+                      return fmt(used) + "/" + fmt(total);
+                  } catch (Exception e) {
+                      return "Н/Д";
+                  }
+              }
+
               private void updateStatusBanner() {
                   File ext = Environment.getExternalStorageDirectory();
                   long totalSpace = ext.getTotalSpace();
-                  long freeSpace = ext.getFreeSpace();
-                  long usedSpace = totalSpace - freeSpace;
-                  statusText.setText("Приложений: " + appList.size() + " | Папок: " + folderList.size() +
+                  long usedSpace = totalSpace - ext.getFreeSpace();
+                  statusText.setText("Прил: " + displayApps.size() + "/" + allApps.size() +
+                          " | Папок: " + displayFolders.size() +
                           " | Занято: " + fmt(usedSpace) + " из " + fmt(totalSpace));
               }
 
-              private void applySorting() {
-                  // Сортировка приложений
-                  Collections.sort(appList, (a, b) -> {
+              private void applyFilterAndSort() {
+                  // 1. Фильтрация приложений
+                  displayApps.clear();
+                  for (AppItem a : allApps) {
+                      if (appFilterMode == 1 && a.isSystem) continue;
+                      if (appFilterMode == 2 && !a.isSystem) continue;
+                      if (!searchQuery.isEmpty()) {
+                          if (!a.name.toLowerCase(Locale.getDefault()).contains(searchQuery) &&
+                              !a.pkg.toLowerCase(Locale.getDefault()).contains(searchQuery)) {
+                              continue;
+                          }
+                      }
+                      displayApps.add(a);
+                  }
+
+                  Collections.sort(displayApps, (a, b) -> {
                       switch (sortMode) {
                           case 1: return Long.compare(a.totalAppSize, b.totalAppSize);
                           case 2: return a.name.compareToIgnoreCase(b.name);
                           case 3: return b.name.compareToIgnoreCase(a.name);
+                          case 4: return Long.compare(b.cacheSize, a.cacheSize);
+                          case 5: return Long.compare(b.installTime, a.installTime);
                           default: return Long.compare(b.totalAppSize, a.totalAppSize);
                       }
                   });
 
-                  // Сортировка папок
-                  Collections.sort(folderList, (a, b) -> {
+                  // 2. Фильтрация папок
+                  displayFolders.clear();
+                  for (FolderItem f : allFolders) {
+                      if (!searchQuery.isEmpty() && !f.name.toLowerCase(Locale.getDefault()).contains(searchQuery)) {
+                          continue;
+                      }
+                      displayFolders.add(f);
+                  }
+
+                  Collections.sort(displayFolders, (a, b) -> {
                       switch (sortMode) {
                           case 1: return Long.compare(a.size, b.size);
                           case 2: return a.name.compareToIgnoreCase(b.name);
@@ -457,9 +1027,36 @@ jobs:
                       }
                   });
 
+                  // 3. Фильтрация анализатора
+                  displayAnalyzer.clear();
+                  for (AnalyzerItem ai : allAnalyzer) {
+                      if (!searchQuery.isEmpty() &&
+                          !ai.title.toLowerCase(Locale.getDefault()).contains(searchQuery) &&
+                          !ai.subtitle.toLowerCase(Locale.getDefault()).contains(searchQuery)) {
+                          continue;
+                      }
+                      displayAnalyzer.add(ai);
+                  }
+
+                  // 4. Фильтрация процессов
+                  displayProcs.clear();
+                  for (ProcItem p : allProcs) {
+                      if (appFilterMode == 1 && p.isSystem) continue;
+                      if (appFilterMode == 2 && !p.isSystem) continue;
+                      if (!searchQuery.isEmpty() &&
+                          !p.name.toLowerCase(Locale.getDefault()).contains(searchQuery) &&
+                          !p.pkg.toLowerCase(Locale.getDefault()).contains(searchQuery)) {
+                          continue;
+                      }
+                      displayProcs.add(p);
+                  }
+
                   if (adapterApps != null) adapterApps.notifyDataSetChanged();
                   if (adapterFolders != null) adapterFolders.notifyDataSetChanged();
                   if (adapterPkgs != null) adapterPkgs.notifyDataSetChanged();
+                  if (adapterAnalyzer != null) adapterAnalyzer.notifyDataSetChanged();
+                  if (adapterProcs != null) adapterProcs.notifyDataSetChanged();
+                  updateStatusBanner();
               }
 
               private long getFolderSize(File dir) {
@@ -486,44 +1083,50 @@ jobs:
                   return f.delete();
               }
 
-              // Адаптер для вкладки 1 (Приложения с полным весом) и вкладки 3 (Пакеты только APK)
+              // Адаптер для вкладок Приложения и Пакеты
               private BaseAdapter createAppAdapter(boolean fullMode) {
                   return new BaseAdapter() {
-                      @Override
-                      public int getCount() { return appList.size(); }
-                      @Override
-                      public Object getItem(int pos) { return appList.get(pos); }
-                      @Override
-                      public long getItemId(int pos) { return pos; }
+                      @Override public int getCount() { return displayApps.size(); }
+                      @Override public Object getItem(int pos) { return displayApps.get(pos); }
+                      @Override public long getItemId(int pos) { return pos; }
 
                       @Override
                       public View getView(int pos, View convertView, ViewGroup parent) {
-                          AppItem item = appList.get(pos);
+                          AppItem item = displayApps.get(pos);
 
                           LinearLayout row = new LinearLayout(MainActivity.this);
                           row.setOrientation(LinearLayout.HORIZONTAL);
-                          row.setPadding(16, 14, 16, 14);
+                          row.setPadding(10, 10, 10, 10);
                           row.setGravity(Gravity.CENTER_VERTICAL);
+
+                          CheckBox cb = new CheckBox(MainActivity.this);
+                          cb.setChecked(selectedApps.contains(item.pkg));
+                          cb.setOnClickListener(v -> {
+                              if (cb.isChecked()) selectedApps.add(item.pkg);
+                              else selectedApps.remove(item.pkg);
+                              updateBatchButton();
+                          });
+                          row.addView(cb);
 
                           ImageView icon = new ImageView(MainActivity.this);
                           icon.setImageDrawable(item.icon);
-                          LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(90, 90);
-                          iconLp.rightMargin = 16;
+                          LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(84, 84);
+                          iconLp.rightMargin = 14;
                           row.addView(icon, iconLp);
 
                           TextView text = new TextView(MainActivity.this);
+                          text.setTextSize(12.5f);
                           LinearLayout.LayoutParams textLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
 
                           if (fullMode) {
-                              String info = item.name + "\nВсего: " + fmt(item.totalAppSize);
+                              String info = item.name + (item.isSystem ? " [Сист]" : "") + "\nВсего: " + fmt(item.totalAppSize);
                               if (item.dataSize > 0 || item.cacheSize > 0) {
-                                  info += "\nAPK: " + fmt(item.apkOnlySize) + " | Данные: " + fmt(item.dataSize);
+                                  info += "\nAPK: " + fmt(item.apkOnlySize) + " | Дан: " + fmt(item.dataSize) + " | Кэш: " + fmt(item.cacheSize);
                               }
                               text.setText(info);
                               row.addView(text, textLp);
 
-                              Button delBtn = new Button(MainActivity.this);
-                              delBtn.setText("Удалить");
+                              Button delBtn = smallBtn("Удалить");
                               delBtn.setOnClickListener(v -> confirmDeleteApp(item));
                               row.addView(delBtn);
                           } else {
@@ -537,40 +1140,46 @@ jobs:
                   };
               }
 
-              // Адаптер для вкладки 2 (Папки и файлы во внутренней памяти)
+              // Адаптер для вкладки Папки
               private BaseAdapter createFolderAdapter() {
                   return new BaseAdapter() {
-                      @Override
-                      public int getCount() { return folderList.size(); }
-                      @Override
-                      public Object getItem(int pos) { return folderList.get(pos); }
-                      @Override
-                      public long getItemId(int pos) { return pos; }
+                      @Override public int getCount() { return displayFolders.size(); }
+                      @Override public Object getItem(int pos) { return displayFolders.get(pos); }
+                      @Override public long getItemId(int pos) { return pos; }
 
                       @Override
                       public View getView(int pos, View convertView, ViewGroup parent) {
-                          FolderItem item = folderList.get(pos);
+                          FolderItem item = displayFolders.get(pos);
 
                           LinearLayout row = new LinearLayout(MainActivity.this);
                           row.setOrientation(LinearLayout.HORIZONTAL);
-                          row.setPadding(16, 16, 16, 16);
+                          row.setPadding(10, 12, 10, 12);
                           row.setGravity(Gravity.CENTER_VERTICAL);
+
+                          CheckBox cb = new CheckBox(MainActivity.this);
+                          cb.setChecked(selectedFiles.contains(item.file));
+                          cb.setOnClickListener(v -> {
+                              if (cb.isChecked()) selectedFiles.add(item.file);
+                              else selectedFiles.remove(item.file);
+                              updateBatchButton();
+                          });
+                          row.addView(cb);
 
                           TextView iconTxt = new TextView(MainActivity.this);
                           iconTxt.setText(item.isDir ? "📁" : "📄");
-                          iconTxt.setTextSize(24f);
-                          iconTxt.setPadding(0, 0, 20, 0);
+                          iconTxt.setTextSize(20f);
+                          iconTxt.setPadding(4, 0, 14, 0);
                           row.addView(iconTxt);
 
                           TextView text = new TextView(MainActivity.this);
+                          text.setTextSize(12.5f);
                           LinearLayout.LayoutParams textLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-                          String subInfo = item.isDir ? ("Объектов внутри: " + item.itemCount) : "Файл";
+                          String subInfo = item.isDir ? ("Объектов: " + item.itemCount) : "Файл";
                           text.setText(item.name + "\nВес: " + fmt(item.size) + " | " + subInfo);
                           row.addView(text, textLp);
 
-                          Button delBtn = new Button(MainActivity.this);
-                          delBtn.setText("Удалить");
-                          delBtn.setOnClickListener(v -> confirmDeleteFolder(item));
+                          Button delBtn = smallBtn("Удалить");
+                          delBtn.setOnClickListener(v -> confirmDeleteFile(item.file, item.name, item.size));
                           row.addView(delBtn);
 
                           row.setOnClickListener(v -> {
@@ -582,6 +1191,85 @@ jobs:
                               }
                           });
 
+                          return row;
+                      }
+                  };
+              }
+
+              // Адаптер для вкладки Анализ
+              private BaseAdapter createAnalyzerAdapter() {
+                  return new BaseAdapter() {
+                      @Override public int getCount() { return displayAnalyzer.size(); }
+                      @Override public Object getItem(int pos) { return displayAnalyzer.get(pos); }
+                      @Override public long getItemId(int pos) { return pos; }
+
+                      @Override
+                      public View getView(int pos, View convertView, ViewGroup parent) {
+                          AnalyzerItem item = displayAnalyzer.get(pos);
+
+                          LinearLayout row = new LinearLayout(MainActivity.this);
+                          row.setOrientation(LinearLayout.HORIZONTAL);
+                          row.setPadding(12, 10, 12, 10);
+                          row.setGravity(Gravity.CENTER_VERTICAL);
+
+                          TextView text = new TextView(MainActivity.this);
+                          text.setTextSize(12f);
+                          text.setText(item.title + " (" + fmt(item.size) + ")\n" + item.subtitle);
+                          row.addView(text, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                          if (item.file != null) {
+                              Button delBtn = smallBtn("Удалить");
+                              delBtn.setOnClickListener(v -> confirmDeleteFile(item.file, item.title, item.size));
+                              row.addView(delBtn);
+                          }
+                          return row;
+                      }
+                  };
+              }
+
+              // Адаптер для вкладки Диспетчер процессов
+              private BaseAdapter createProcAdapter() {
+                  return new BaseAdapter() {
+                      @Override public int getCount() { return displayProcs.size(); }
+                      @Override public Object getItem(int pos) { return displayProcs.get(pos); }
+                      @Override public long getItemId(int pos) { return pos; }
+
+                      @Override
+                      public View getView(int pos, View convertView, ViewGroup parent) {
+                          ProcItem item = displayProcs.get(pos);
+
+                          LinearLayout row = new LinearLayout(MainActivity.this);
+                          row.setOrientation(LinearLayout.HORIZONTAL);
+                          row.setPadding(10, 10, 10, 10);
+                          row.setGravity(Gravity.CENTER_VERTICAL);
+
+                          ImageView icon = new ImageView(MainActivity.this);
+                          icon.setImageDrawable(item.icon);
+                          LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(76, 76);
+                          iconLp.rightMargin = 12;
+                          row.addView(icon, iconLp);
+
+                          TextView text = new TextView(MainActivity.this);
+                          text.setTextSize(12f);
+                          String ramStr = item.ramBytes > 0 ? (" | ОЗУ: " + fmt(item.ramBytes)) : "";
+                          String sysTag = item.isSystem ? " [Сист]" : " [Польз]";
+                          text.setText(item.name + sysTag + "\n" + item.pkg + "\n" + item.stateInfo + ramStr);
+                          row.addView(text, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                          Button killBtn = smallBtn("Стоп");
+                          killBtn.setOnClickListener(v -> {
+                              ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                              am.killBackgroundProcesses(item.pkg);
+                              Toast.makeText(MainActivity.this, "Фон остановлен: " + item.pkg, Toast.LENGTH_SHORT).show();
+                              loadProcessesAsync();
+                          });
+                          row.addView(killBtn);
+
+                          row.setOnClickListener(v -> {
+                              Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                      Uri.parse("package:" + item.pkg));
+                              startActivity(intent);
+                          });
                           return row;
                       }
                   };
@@ -599,15 +1287,15 @@ jobs:
                           .show();
               }
 
-              private void confirmDeleteFolder(FolderItem item) {
+              private void confirmDeleteFile(File file, String title, long size) {
                   new AlertDialog.Builder(this)
                           .setTitle("Удаление из памяти")
-                          .setMessage("Удалить " + (item.isDir ? "папку" : "файл") + " «" + item.name + "» (" + fmt(item.size) + ") навсегда?")
+                          .setMessage("Удалить «" + title + "» (" + fmt(size) + ") навсегда?")
                           .setPositiveButton("Удалить", (d, w) -> {
                               new Thread(() -> {
-                                  boolean ok = deleteRecursive(item.file);
+                                  boolean ok = deleteRecursive(file);
                                   runOnUiThread(() -> {
-                                      Toast.makeText(this, ok ? "Удалено" : "Ошибка удаления (проверьте Права)", Toast.LENGTH_SHORT).show();
+                                      Toast.makeText(this, ok ? "Удалено" : "Ошибка удаления", Toast.LENGTH_SHORT).show();
                                       loadFoldersAsync();
                                   });
                               }).start();
@@ -616,60 +1304,270 @@ jobs:
                           .show();
               }
 
+              // Извлечение (Бэкап) APK в папку Download/MiniStorage_Backups
+              private void extractApkBackup(AppItem item) {
+                  new Thread(() -> {
+                      try {
+                          File src = new File(item.pkgInfo.applicationInfo.sourceDir);
+                          File outDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "MiniStorage_Backups");
+                          if (!outDir.exists()) outDir.mkdirs();
+                          File dst = new File(outDir, item.pkg + "_" + item.pkgInfo.versionName + ".apk");
+
+                          try (FileInputStream in = new FileInputStream(src);
+                               FileOutputStream out = new FileOutputStream(dst)) {
+                              byte[] buf = new byte[65536];
+                              int len;
+                              while ((len = in.read(buf)) > 0) {
+                                  out.write(buf, 0, len);
+                              }
+                          }
+                          runOnUiThread(() -> Toast.makeText(this, "Сохранено в: " + dst.getAbsolutePath(), Toast.LENGTH_LONG).show());
+                      } catch (Exception e) {
+                          runOnUiThread(() -> Toast.makeText(this, "Ошибка бэкапа: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                      }
+                  }).start();
+              }
+
+              // Глубокий рентген приложения
               private void showDetailsDialog(AppItem item) {
+                  PackageManager pm = getPackageManager();
                   PackageInfo pi = item.pkgInfo;
                   ApplicationInfo ai = pi.applicationInfo;
 
+                  int flags = PackageManager.GET_PERMISSIONS | PackageManager.GET_ACTIVITIES
+                          | PackageManager.GET_SERVICES | PackageManager.GET_RECEIVERS
+                          | PackageManager.GET_PROVIDERS | PackageManager.GET_SIGNATURES;
+                  try {
+                      pi = pm.getPackageInfo(item.pkg, flags);
+                  } catch (Exception ignored) {}
+
                   LinearLayout layout = new LinearLayout(this);
                   layout.setOrientation(LinearLayout.VERTICAL);
-                  layout.setPadding(32, 32, 32, 32);
+                  layout.setPadding(28, 24, 28, 24);
                   layout.setGravity(Gravity.CENTER_HORIZONTAL);
 
                   ImageView bigIcon = new ImageView(this);
                   bigIcon.setImageDrawable(item.icon);
-                  layout.addView(bigIcon, new LinearLayout.LayoutParams(240, 240));
+                  layout.addView(bigIcon, new LinearLayout.LayoutParams(220, 220));
+
+                  // Кнопки быстрых действий внутри карточки
+                  LinearLayout actBar = new LinearLayout(this);
+                  actBar.setOrientation(LinearLayout.HORIZONTAL);
+                  actBar.setPadding(0, 16, 0, 8);
+
+                  Button backupBtn = smallBtn("Сохранить APK");
+                  backupBtn.setOnClickListener(v -> extractApkBackup(item));
+                  actBar.addView(backupBtn);
+
+                  Button manifestBtn = smallBtn("Манифест");
+                  manifestBtn.setOnClickListener(v -> showManifestViewer(ai.sourceDir));
+                  actBar.addView(manifestBtn);
+
+                  final PackageInfo finalPi = pi;
+                  Button activitiesBtn = smallBtn("Запуск Activity");
+                  activitiesBtn.setOnClickListener(v -> showExportedActivitiesDialog(finalPi));
+                  actBar.addView(activitiesBtn);
+
+                  layout.addView(actBar);
 
                   TextView details = new TextView(this);
-                  details.setPadding(0, 24, 0, 0);
+                  details.setTextSize(12f);
+                  details.setPadding(0, 12, 0, 0);
                   SimpleDateFormat sdf = new SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault());
 
                   long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P ? pi.getLongVersionCode() : pi.versionCode;
                   int minSdk = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N ? ai.minSdkVersion : 0;
-                  boolean isSystem = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
 
-                  String techInfo = "Имя: " + item.name + "\n" +
-                          "Пакет: " + item.pkg + "\n" +
-                          "Версия: " + pi.versionName + " (" + vCode + ")\n\n" +
-                          "--- Занимаемое место ---\n" +
-                          "Всего: " + fmt(item.totalAppSize) + "\n" +
-                          "Вес APK (без папок): " + fmt(item.apkOnlySize) + "\n" +
-                          "Данные (вкл. Android/data): " + fmt(item.dataSize) + "\n" +
-                          "Кэш: " + fmt(item.cacheSize) + "\n\n" +
-                          "--- Техническая информация ---\n" +
-                          "Target SDK: " + ai.targetSdkVersion + " | Min SDK: " + minSdk + "\n" +
-                          "UID: " + ai.uid + " | Системное: " + (isSystem ? "Да" : "Нет") + "\n" +
-                          "APK путь: " + ai.sourceDir + "\n" +
-                          "Data путь: " + ai.dataDir + "\n" +
-                          "Установлено: " + sdf.format(new Date(pi.firstInstallTime)) + "\n" +
-                          "Обновлено: " + sdf.format(new Date(pi.lastUpdateTime));
+                  String installer = "Неизвестно (ADB / Файл)";
+                  try {
+                      String inst = pm.getInstallerPackageName(item.pkg);
+                      if (inst != null) installer = inst;
+                  } catch (Exception ignored) {}
 
-                  details.setText(techInfo);
+                  String sigHash = getSignatureSha256(pi);
+                  String nativeDir = ai.nativeLibraryDir != null ? ai.nativeLibraryDir : "Нет";
+
+                  int actCount = pi.activities != null ? pi.activities.length : 0;
+                  int srvCount = pi.services != null ? pi.services.length : 0;
+                  int rcvCount = pi.receivers != null ? pi.receivers.length : 0;
+                  int prvCount = pi.providers != null ? pi.providers.length : 0;
+
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("Имя: ").append(item.name).append("\n")
+                    .append("Пакет: ").append(item.pkg).append("\n")
+                    .append("Версия: ").append(pi.versionName).append(" (").append(vCode).append(")\n\n")
+                    .append("--- Память ---\n")
+                    .append("Всего: ").append(fmt(item.totalAppSize)).append("\n")
+                    .append("Чистый APK: ").append(fmt(item.apkOnlySize)).append("\n")
+                    .append("Данные (вкл. Android/data): ").append(fmt(item.dataSize)).append("\n")
+                    .append("Кэш: ").append(fmt(item.cacheSize)).append("\n\n")
+                    .append("--- Рентген и Тех. данные ---\n")
+                    .append("Target SDK: ").append(ai.targetSdkVersion).append(" | Min SDK: ").append(minSdk).append("\n")
+                    .append("UID: ").append(ai.uid).append(" | Системное: ").append(item.isSystem ? "Да" : "Нет").append("\n")
+                    .append("Источник: ").append(installer).append("\n")
+                    .append("Нативные библ.: ").append(nativeDir).append("\n")
+                    .append("SHA-256 подписи: ").append(sigHash).append("\n")
+                    .append("APK: ").append(ai.sourceDir).append("\n")
+                    .append("Data: ").append(ai.dataDir).append("\n")
+                    .append("Установлено: ").append(sdf.format(new Date(pi.firstInstallTime))).append("\n")
+                    .append("Обновлено: ").append(sdf.format(new Date(pi.lastUpdateTime))).append("\n\n")
+                    .append("--- Компоненты ---\n")
+                    .append("Activities: ").append(actCount).append(" | Services: ").append(srvCount)
+                    .append(" | Receivers: ").append(rcvCount).append(" | Providers: ").append(prvCount).append("\n\n")
+                    .append("--- Запрошенные разрешения ---\n");
+
+                  if (pi.requestedPermissions != null && pi.requestedPermissions.length > 0) {
+                      for (String perm : pi.requestedPermissions) {
+                          boolean dangerous = false;
+                          try {
+                              PermissionInfo pInfo = pm.getPermissionInfo(perm, 0);
+                              dangerous = (pInfo.protectionLevel & PermissionInfo.PROTECTION_MASK_BASE) == PermissionInfo.PROTECTION_DANGEROUS;
+                          } catch (Exception ignored) {}
+                          sb.append("• ").append(perm.replace("android.permission.", ""))
+                            .append(dangerous ? " [ОПАСНОЕ]\n" : "\n");
+                      }
+                  } else {
+                      sb.append("Нет разрешений\n");
+                  }
+
+                  details.setText(sb.toString());
                   layout.addView(details);
 
                   ScrollView scroll = new ScrollView(this);
                   scroll.addView(layout);
 
                   new AlertDialog.Builder(this)
-                          .setTitle("Информация о приложении")
+                          .setTitle(item.name)
                           .setView(scroll)
                           .setPositiveButton("Закрыть", null)
-                          .setNeutralButton("Системные настройки", (d, w) -> {
+                          .setNeutralButton("Настройки ОС", (d, w) -> {
                               Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                       Uri.parse("package:" + item.pkg));
                               startActivity(intent);
                           })
                           .setNegativeButton("Удалить", (d, w) -> confirmDeleteApp(item))
                           .show();
+              }
+
+              private void showExportedActivitiesDialog(PackageInfo pi) {
+                  List<String> exported = new ArrayList<>();
+                  if (pi.activities != null) {
+                      for (ActivityInfo ai : pi.activities) {
+                          if (ai.exported) exported.add(ai.name);
+                      }
+                  }
+                  if (exported.isEmpty()) {
+                      Toast.makeText(this, "Открытых (exported) Activity не найдено", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  String[] arr = exported.toArray(new String[0]);
+                  new AlertDialog.Builder(this)
+                          .setTitle("Запуск Activity (" + arr.length + ")")
+                          .setItems(arr, (d, which) -> {
+                              try {
+                                  Intent i = new Intent();
+                                  i.setComponent(new ComponentName(pi.packageName, arr[which]));
+                                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                  startActivity(i);
+                              } catch (Exception e) {
+                                  Toast.makeText(this, "Не удалось запустить: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                              }
+                          })
+                          .setPositiveButton("Закрыть", null)
+                          .show();
+              }
+
+              private String getSignatureSha256(PackageInfo pi) {
+                  try {
+                      if (pi.signatures != null && pi.signatures.length > 0) {
+                          Signature sig = pi.signatures[0];
+                          MessageDigest md = MessageDigest.getInstance("SHA-256");
+                          byte[] d = md.digest(sig.toByteArray());
+                          StringBuilder sb = new StringBuilder();
+                          for (int i = 0; i < Math.min(12, d.length); i++) {
+                              sb.append(String.format("%02X:", d[i]));
+                          }
+                          return sb.substring(0, sb.length() - 1) + "...";
+                      }
+                  } catch (Exception ignored) {}
+                  return "Н/Д";
+              }
+
+              // Встроенный микро-декодер бинарного AndroidManifest.xml напрямую из APK (0 библиотек)
+              private void showManifestViewer(String apkPath) {
+                  new Thread(() -> {
+                      String text = extractManifestStrings(apkPath);
+                      runOnUiThread(() -> {
+                          TextView tv = new TextView(this);
+                          tv.setPadding(24, 24, 24, 24);
+                          tv.setTextSize(11f);
+                          tv.setText(text);
+                          ScrollView sv = new ScrollView(this);
+                          sv.addView(tv);
+                          new AlertDialog.Builder(this)
+                                  .setTitle("AndroidManifest.xml")
+                                  .setView(sv)
+                                  .setPositiveButton("Закрыть", null)
+                                  .show();
+                      });
+                  }).start();
+              }
+
+              private String extractManifestStrings(String apkPath) {
+                  try (ZipFile zip = new ZipFile(apkPath)) {
+                      ZipEntry entry = zip.getEntry("AndroidManifest.xml");
+                      if (entry == null) return "Манифест не найден";
+                      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                      try (InputStream is = zip.getInputStream(entry)) {
+                          byte[] buf = new byte[8192];
+                          int r;
+                          while ((r = is.read(buf)) > 0) baos.write(buf, 0, r);
+                      }
+                      byte[] data = baos.toByteArray();
+                      ByteBuffer bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+                      if (bb.remaining() < 24) return "Пустой манифест";
+
+                      // Читаем пул строк бинарного AXML
+                      bb.position(8);
+                      int chunkType = bb.getShort() & 0xFFFF;
+                      int headerSize = bb.getShort() & 0xFFFF;
+                      int chunkSize = bb.getInt();
+                      int stringCount = bb.getInt();
+                      bb.getInt(); // styleCount
+                      int flags = bb.getInt();
+                      int stringsStart = bb.getInt();
+                      boolean isUtf8 = (flags & 0x100) != 0;
+
+                      int[] offsets = new int[stringCount];
+                      for (int i = 0; i < stringCount; i++) {
+                          offsets[i] = bb.getInt();
+                      }
+
+                      int base = 8 + stringsStart;
+                      StringBuilder out = new StringBuilder();
+                      for (int i = 0; i < stringCount; i++) {
+                          int pos = base + offsets[i];
+                          if (pos >= data.length) continue;
+                          String s;
+                          if (isUtf8) {
+                              int u16len = data[pos++] & 0xFF;
+                              if ((u16len & 0x80) != 0) pos++;
+                              int u8len = data[pos++] & 0xFF;
+                              if ((u8len & 0x80) != 0) u8len = ((u8len & 0x7F) << 8) | (data[pos++] & 0xFF);
+                              s = new String(data, pos, Math.min(u8len, data.length - pos), "UTF-8");
+                          } else {
+                              int u16len = (data[pos] & 0xFF) | ((data[pos + 1] & 0xFF) << 8);
+                              pos += 2;
+                              s = new String(data, pos, Math.min(u16len * 2, data.length - pos), "UTF-16LE");
+                          }
+                          if (s.length() > 1 && !s.startsWith("http")) {
+                              out.append(s).append("\n");
+                          }
+                      }
+                      return out.toString();
+                  } catch (Exception e) {
+                      return "Ошибка чтения манифеста: " + e.getMessage();
+                  }
               }
 
               private String fmt(long bytes) {
